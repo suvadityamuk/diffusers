@@ -52,6 +52,7 @@ from diffusers import (
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available, make_image_grid
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
 
 
 if is_wandb_available():
@@ -685,6 +686,7 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
             prompt_embeds = text_encoder(
                 text_input_ids.to(text_encoder.device),
                 output_hidden_states=True,
+                return_dict=False,
             )
 
             # We are only ALWAYS interested in the pooled output of the final text encoder
@@ -766,6 +768,12 @@ def main(args):
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
+
+    # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -908,9 +916,9 @@ def main(args):
         " doing mixed precision training, copy of the weights should still be float32."
     )
 
-    if accelerator.unwrap_model(controlnet).dtype != torch.float32:
+    if unwrap_model(controlnet).dtype != torch.float32:
         raise ValueError(
-            f"Controlnet loaded as datatype {accelerator.unwrap_model(controlnet).dtype}. {low_precision_error_string}"
+            f"Controlnet loaded as datatype {unwrap_model(controlnet).dtype}. {low_precision_error_string}"
         )
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -1158,7 +1166,8 @@ def main(args):
                         sample.to(dtype=weight_dtype) for sample in down_block_res_samples
                     ],
                     mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
-                ).sample
+                    return_dict=False,
+                )[0]
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -1223,7 +1232,7 @@ def main(args):
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        controlnet = accelerator.unwrap_model(controlnet)
+        controlnet = unwrap_model(controlnet)
         controlnet.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
